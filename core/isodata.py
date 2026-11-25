@@ -1,4 +1,4 @@
-"""Thuật toán phân cụm ISODATA tự cài đặt bằng NumPy (Bước 4: bổ sung bước gộp cụm)."""
+"""Thuật toán phân cụm ISODATA tự cài đặt bằng NumPy (đầy đủ loại nhỏ, tách và gộp cụm)."""
 
 from dataclasses import dataclass, field
 import numpy as np
@@ -18,6 +18,7 @@ class IsodataParams:
     L: int = 2
     max_iter: int = 20
     seed: int = 42
+    split_gamma: float = 0.5
 
 
 @dataclass
@@ -106,11 +107,71 @@ def _merge_clusters(
     return all_centers, merge_events
 
 
+def _split_clusters(
+    X: np.ndarray,
+    labels: np.ndarray,
+    centers: np.ndarray,
+    params: IsodataParams,
+    iteration: int,
+) -> tuple[np.ndarray, list[str]]:
+    """Tách các cụm có độ lệch chuẩn lớn nhất vượt theta_S nếu thỏa điều kiện về K và số mẫu.
+
+    Cụm bị tách được thay thế bằng hai tâm mới: tâm cũ ± split_gamma * sigma_max
+    dọc theo chiều có độ lệch chuẩn lớn nhất.
+    Trả về (centers_after_split, split_events).
+    """
+    k_init = centers.shape[0]
+    k_current = k_init
+    new_centers_list: list[np.ndarray] = []
+    split_events: list[str] = []
+
+    for j in range(k_init):
+        mask = labels == j  # (N,)
+        n_j = int(np.sum(mask))
+        center_j = centers[j]  # (d,)
+
+        if n_j <= 1 or k_current >= params.K_max:
+            new_centers_list.append(center_j)
+            continue
+
+        cluster_pts = X[mask]  # (n_j, d)
+        stds = np.std(cluster_pts, axis=0)  # (d,)
+        dim_max = int(np.argmax(stds))
+        sigma_max = float(stds[dim_max])
+
+        can_split_by_k_or_size = (k_current <= params.K0 / 2) or (
+            n_j > 2 * (params.theta_N + 1)
+        )
+        if sigma_max > params.theta_S and can_split_by_k_or_size:
+            offset = np.zeros_like(center_j)  # (d,)
+            offset[dim_max] = params.split_gamma * sigma_max
+            c_minus = center_j - offset  # (d,)
+            c_plus = center_j + offset  # (d,)
+
+            new_centers_list.extend([c_minus, c_plus])
+            # Thay 1 cụm bằng 2 cụm làm tổng số cụm tăng thêm 1.
+            k_current += 1
+
+            c_minus_str = np.array2string(c_minus, precision=2, separator=", ")
+            c_plus_str = np.array2string(c_plus, precision=2, separator=", ")
+            split_events.append(
+                f"[split] Vòng {iteration}: tách cụm {j} (sigma_max = {sigma_max:.3f} "
+                f"ở chiều {dim_max}), 2 tâm mới = {c_minus_str} và {c_plus_str}"
+            )
+        else:
+            new_centers_list.append(center_j)
+
+    if not split_events:
+        return centers, []
+
+    return np.vstack(new_centers_list), split_events  # (K_new, d)
+
+
 def isodata(X: np.ndarray, params: IsodataParams, tol: float = 1e-4) -> IsodataResult:
-    """Phân cụm dữ liệu X (N, d) bằng ISODATA (Bước 4: lọc cụm nhỏ + gộp cụm gần nhau).
+    """Phân cụm dữ liệu X (N, d) bằng thuật toán ISODATA đầy đủ.
 
     Mỗi vòng lặp thực hiện: gán nhãn -> loại cụm < theta_N -> cập nhật tâm
-    -> gộp các cặp cụm có khoảng cách < theta_c -> ghi lịch sử.
+    -> [tách ở vòng lẻ, gộp ở vòng chẵn hoặc khi K quá lớn] -> ghi lịch sử.
     """
     X_arr = np.asarray(X, dtype=np.float64)  # (N, d)
     if X_arr.ndim != 2:
@@ -157,19 +218,29 @@ def isodata(X: np.ndarray, params: IsodataParams, tol: float = 1e-4) -> IsodataR
                 f"Loại {len(dropped_indices)} cụm (chỉ số {dropped_indices}) do < {params.theta_N} mẫu; còn {centers.shape[0]} cụm."
             )
 
-        # 3. Cập nhật tâm cụm, gộp các cặp tâm gần nhau (< theta_c) và đồng bộ nhãn / SSE.
+        # 3. Cập nhật tâm cụm và đồng bộ nhãn.
         k_kept = centers.shape[0]
         new_centers = update_centers(X_arr, labels, k_kept, prev_centers=centers)  # (K_kept, d)
         labels = assign_clusters(X_arr, new_centers)  # (N,)
 
-        counts_after = np.bincount(labels, minlength=k_kept)  # (K_kept,)
-        merged_centers, merge_events = _merge_clusters(
-            new_centers, counts_after, params.theta_c, params.L, it
-        )
-        if merge_events:
-            events.extend(merge_events)
-            new_centers = merged_centers  # (K_final, d)
-            labels = assign_clusters(X_arr, new_centers)  # (N,)
+        # 4. Tách ở vòng lẻ, gộp ở vòng chẵn hoặc khi K quá lớn (>= K_max hoặc >= 2*K0).
+        if k_kept >= params.K_max or k_kept >= 2 * params.K0 or it % 2 == 0:
+            counts_after = np.bincount(labels, minlength=k_kept)  # (K_kept,)
+            merged_centers, merge_events = _merge_clusters(
+                new_centers, counts_after, params.theta_c, params.L, it
+            )
+            if merge_events:
+                events.extend(merge_events)
+                new_centers = merged_centers  # (K_final, d)
+                labels = assign_clusters(X_arr, new_centers)  # (N,)
+        else:
+            split_centers, split_events = _split_clusters(
+                X_arr, labels, new_centers, params, it
+            )
+            if split_events:
+                events.extend(split_events)
+                new_centers = split_centers  # (K_final, d)
+                labels = assign_clusters(X_arr, new_centers)  # (N,)
 
         k_final = new_centers.shape[0]
         sse = compute_sse(X_arr, labels, new_centers)
@@ -184,8 +255,9 @@ def isodata(X: np.ndarray, params: IsodataParams, tol: float = 1e-4) -> IsodataR
             )
         )
 
-        # Chỉ kiểm tra hội tụ khi số cụm không thay đổi so với đầu vòng lặp.
-        if k_final == prev_centers.shape[0]:
+        # Chỉ dừng sớm từ vòng >= 2 khi không còn sự kiện thay đổi cụm và tâm đã hội tụ,
+        # tránh dừng ở vòng lẻ đầu tiên trước khi vòng chẵn kịp kiểm tra gộp.
+        if it >= 2 and not events and k_final == prev_centers.shape[0]:
             max_shift = float(np.max(np.linalg.norm(new_centers - prev_centers, axis=1)))
             if max_shift < tol:
                 centers = new_centers
