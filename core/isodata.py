@@ -1,4 +1,4 @@
-"""Thuật toán phân cụm ISODATA tự cài đặt bằng NumPy (Bước 3: chưa có tách/gộp)."""
+"""Thuật toán phân cụm ISODATA tự cài đặt bằng NumPy (Bước 4: bổ sung bước gộp cụm)."""
 
 from dataclasses import dataclass, field
 import numpy as np
@@ -41,11 +41,76 @@ class IsodataResult:
     n_iter: int
 
 
-def isodata(X: np.ndarray, params: IsodataParams, tol: float = 1e-4) -> IsodataResult:
-    """Phân cụm dữ liệu X (N, d) bằng ISODATA (phiên bản Bước 3: lọc cụm nhỏ, chưa tách/gộp).
+def _merge_clusters(
+    centers: np.ndarray,
+    counts: np.ndarray,
+    theta_c: float,
+    max_merges: int,
+    iteration: int,
+) -> tuple[np.ndarray, list[str]]:
+    """Gộp tối đa max_merges cặp tâm có khoảng cách < theta_c (mỗi cụm gộp tối đa 1 lần).
 
-    Mỗi vòng lặp thực hiện: gán nhãn -> loại cụm có ít hơn theta_N mẫu (và gán lại)
-    -> cập nhật tâm -> ghi lịch sử.
+    Tâm mới được tính theo trung bình có trọng số số mẫu của hai cụm.
+    Trả về (centers_after_merge, merge_events).
+    """
+    k = centers.shape[0]
+    if k < 2 or max_merges <= 0:
+        return centers, []
+
+    # Số cụm K nhỏ nên tính ma trận khoảng cách (K, K) trực tiếp rất gọn và nhanh.
+    diff = centers[:, None, :] - centers[None, :, :]  # (K, K, d)
+    dist_matrix = np.linalg.norm(diff, axis=2)  # (K, K)
+
+    i_idx, j_idx = np.triu_indices(k, k=1)
+    pair_dists = dist_matrix[i_idx, j_idx]
+    valid_mask = pair_dists < theta_c
+    if not np.any(valid_mask):
+        return centers, []
+
+    valid_pairs = sorted(
+        zip(pair_dists[valid_mask], i_idx[valid_mask], j_idx[valid_mask]),
+        key=lambda item: item[0],
+    )
+
+    merged_ids: set[int] = set()
+    merged_centers: list[np.ndarray] = []
+    merge_events: list[str] = []
+
+    for dist, i_raw, j_raw in valid_pairs:
+        if len(merge_events) >= max_merges:
+            break
+        i, j = int(i_raw), int(j_raw)
+        if i in merged_ids or j in merged_ids:
+            continue
+
+        n_i, n_j = int(counts[i]), int(counts[j])
+        total_n = n_i + n_j
+        if total_n > 0:
+            new_c = (n_i * centers[i] + n_j * centers[j]) / total_n  # (d,)
+        else:
+            new_c = 0.5 * (centers[i] + centers[j])  # (d,)
+
+        merged_ids.update((i, j))
+        merged_centers.append(new_c)
+        center_str = np.array2string(new_c, precision=2, separator=", ")
+        merge_events.append(
+            f"[merge] Vòng {iteration}: gộp cụm {i} và {j} "
+            f"(khoảng cách = {dist:.3f}), tâm mới = {center_str}"
+        )
+
+    if not merge_events:
+        return centers, []
+
+    kept_centers = [centers[idx] for idx in range(k) if idx not in merged_ids]
+    all_centers = np.vstack(kept_centers + merged_centers)  # (K_new, d)
+    return all_centers, merge_events
+
+
+def isodata(X: np.ndarray, params: IsodataParams, tol: float = 1e-4) -> IsodataResult:
+    """Phân cụm dữ liệu X (N, d) bằng ISODATA (Bước 4: lọc cụm nhỏ + gộp cụm gần nhau).
+
+    Mỗi vòng lặp thực hiện: gán nhãn -> loại cụm < theta_N -> cập nhật tâm
+    -> gộp các cặp cụm có khoảng cách < theta_c -> ghi lịch sử.
     """
     X_arr = np.asarray(X, dtype=np.float64)  # (N, d)
     if X_arr.ndim != 2:
@@ -92,16 +157,27 @@ def isodata(X: np.ndarray, params: IsodataParams, tol: float = 1e-4) -> IsodataR
                 f"Loại {len(dropped_indices)} cụm (chỉ số {dropped_indices}) do < {params.theta_N} mẫu; còn {centers.shape[0]} cụm."
             )
 
-        # 3. Cập nhật tâm cụm và đồng bộ nhãn / SSE cho vòng hiện tại.
+        # 3. Cập nhật tâm cụm, gộp các cặp tâm gần nhau (< theta_c) và đồng bộ nhãn / SSE.
         k_kept = centers.shape[0]
         new_centers = update_centers(X_arr, labels, k_kept, prev_centers=centers)  # (K_kept, d)
         labels = assign_clusters(X_arr, new_centers)  # (N,)
+
+        counts_after = np.bincount(labels, minlength=k_kept)  # (K_kept,)
+        merged_centers, merge_events = _merge_clusters(
+            new_centers, counts_after, params.theta_c, params.L, it
+        )
+        if merge_events:
+            events.extend(merge_events)
+            new_centers = merged_centers  # (K_final, d)
+            labels = assign_clusters(X_arr, new_centers)  # (N,)
+
+        k_final = new_centers.shape[0]
         sse = compute_sse(X_arr, labels, new_centers)
 
         history.append(
             IsodataStepLog(
                 iteration=it,
-                n_clusters=k_kept,
+                n_clusters=k_final,
                 centers=new_centers.copy(),
                 sse=sse,
                 events=events,
@@ -109,7 +185,7 @@ def isodata(X: np.ndarray, params: IsodataParams, tol: float = 1e-4) -> IsodataR
         )
 
         # Chỉ kiểm tra hội tụ khi số cụm không thay đổi so với đầu vòng lặp.
-        if k_kept == prev_centers.shape[0]:
+        if k_final == prev_centers.shape[0]:
             max_shift = float(np.max(np.linalg.norm(new_centers - prev_centers, axis=1)))
             if max_shift < tol:
                 centers = new_centers
