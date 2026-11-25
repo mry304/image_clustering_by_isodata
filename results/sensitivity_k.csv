@@ -1,0 +1,17 @@
+﻿Ảnh,theta_S,theta_c,K_cuối,Số_vòng,SSE
+astronaut.png,10.0,10.0,12,15,15850204.62
+astronaut.png,10.0,18.0,11,15,18380255.95
+astronaut.png,10.0,25.0,10,15,19616484.54
+astronaut.png,10.0,35.0,10,15,20580462.75
+astronaut.png,15.0,10.0,10,15,20233284.74
+astronaut.png,15.0,18.0,10,15,20233284.74
+astronaut.png,15.0,25.0,10,15,18876379.78
+astronaut.png,15.0,35.0,10,15,20792878.28
+astronaut.png,20.0,10.0,7,15,28682916.0
+astronaut.png,20.0,18.0,7,15,28682916.0
+astronaut.png,20.0,25.0,7,15,28682916.0
+astronaut.png,20.0,35.0,7,15,28682916.0
+astronaut.png,25.0,10.0,6,15,36125925.19
+astronaut.png,25.0,18.0,6,15,36125925.19
+astronaut.png,25.0,25.0,6,15,36125925.19
+astronaut.png,25.0,35.0,6,15,36125925.19
