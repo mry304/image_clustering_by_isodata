@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass, field
 import numpy as np
+import pandas as pd
 
 from core.common import assign_clusters, compute_sse, update_centers
 
@@ -30,6 +31,10 @@ class IsodataStepLog:
     centers: np.ndarray
     sse: float
     events: list[str] = field(default_factory=list)
+    labels: np.ndarray | None = None
+    n_split: int = 0
+    n_merge: int = 0
+    n_discarded: int = 0
 
 
 @dataclass
@@ -167,11 +172,17 @@ def _split_clusters(
     return np.vstack(new_centers_list), split_events  # (K_new, d)
 
 
-def isodata(X: np.ndarray, params: IsodataParams, tol: float = 1e-4) -> IsodataResult:
+def isodata(
+    X: np.ndarray,
+    params: IsodataParams,
+    tol: float = 1e-4,
+    record_labels_every: int = 1,
+) -> IsodataResult:
     """Phân cụm dữ liệu X (N, d) bằng thuật toán ISODATA đầy đủ.
 
     Mỗi vòng lặp thực hiện: gán nhãn -> loại cụm < theta_N -> cập nhật tâm
     -> [tách ở vòng lẻ, gộp ở vòng chẵn hoặc khi K quá lớn] -> ghi lịch sử.
+    record_labels_every > 0 cho phép lưu nhãn định kỳ mỗi N vòng để tiết kiệm RAM.
     """
     X_arr = np.asarray(X, dtype=np.float64)  # (N, d)
     if X_arr.ndim != 2:
@@ -210,12 +221,14 @@ def isodata(X: np.ndarray, params: IsodataParams, tol: float = 1e-4) -> IsodataR
                 f"Tất cả {k_curr} cụm đều < {params.theta_N} mẫu; giữ lại cụm lớn nhất ({counts[largest_idx]} mẫu)."
             )
 
+        n_discarded = 0
         if not np.all(keep_mask):
             dropped_indices = np.where(~keep_mask)[0].tolist()
+            n_discarded = len(dropped_indices)
             centers = centers[keep_mask]  # (K_kept, d)
             labels = assign_clusters(X_arr, centers)  # (N,)
             events.append(
-                f"Loại {len(dropped_indices)} cụm (chỉ số {dropped_indices}) do < {params.theta_N} mẫu; còn {centers.shape[0]} cụm."
+                f"Loại {n_discarded} cụm (chỉ số {dropped_indices}) do < {params.theta_N} mẫu; còn {centers.shape[0]} cụm."
             )
 
         # 3. Cập nhật tâm cụm và đồng bộ nhãn.
@@ -224,12 +237,15 @@ def isodata(X: np.ndarray, params: IsodataParams, tol: float = 1e-4) -> IsodataR
         labels = assign_clusters(X_arr, new_centers)  # (N,)
 
         # 4. Tách ở vòng lẻ, gộp ở vòng chẵn hoặc khi K quá lớn (>= K_max hoặc >= 2*K0).
+        n_split = 0
+        n_merge = 0
         if k_kept >= params.K_max or k_kept >= 2 * params.K0 or it % 2 == 0:
             counts_after = np.bincount(labels, minlength=k_kept)  # (K_kept,)
             merged_centers, merge_events = _merge_clusters(
                 new_centers, counts_after, params.theta_c, params.L, it
             )
             if merge_events:
+                n_merge = len(merge_events)
                 events.extend(merge_events)
                 new_centers = merged_centers  # (K_final, d)
                 labels = assign_clusters(X_arr, new_centers)  # (N,)
@@ -238,6 +254,7 @@ def isodata(X: np.ndarray, params: IsodataParams, tol: float = 1e-4) -> IsodataR
                 X_arr, labels, new_centers, params, it
             )
             if split_events:
+                n_split = len(split_events)
                 events.extend(split_events)
                 new_centers = split_centers  # (K_final, d)
                 labels = assign_clusters(X_arr, new_centers)  # (N,)
@@ -245,6 +262,9 @@ def isodata(X: np.ndarray, params: IsodataParams, tol: float = 1e-4) -> IsodataR
         k_final = new_centers.shape[0]
         sse = compute_sse(X_arr, labels, new_centers)
 
+        should_save_labels = record_labels_every > 0 and (
+            it % record_labels_every == 0 or it == params.max_iter
+        )
         history.append(
             IsodataStepLog(
                 iteration=it,
@@ -252,6 +272,10 @@ def isodata(X: np.ndarray, params: IsodataParams, tol: float = 1e-4) -> IsodataR
                 centers=new_centers.copy(),
                 sse=sse,
                 events=events,
+                labels=labels.copy() if should_save_labels else None,
+                n_split=n_split,
+                n_merge=n_merge,
+                n_discarded=n_discarded,
             )
         )
 
@@ -260,6 +284,8 @@ def isodata(X: np.ndarray, params: IsodataParams, tol: float = 1e-4) -> IsodataR
         if it >= 2 and not events and k_final == prev_centers.shape[0]:
             max_shift = float(np.max(np.linalg.norm(new_centers - prev_centers, axis=1)))
             if max_shift < tol:
+                if record_labels_every > 0 and history[-1].labels is None:
+                    history[-1].labels = labels.copy()
                 centers = new_centers
                 break
 
@@ -270,4 +296,23 @@ def isodata(X: np.ndarray, params: IsodataParams, tol: float = 1e-4) -> IsodataR
         centers=centers,
         history=history,
         n_iter=n_iter,
+    )
+
+
+def summarize_history(history: list[IsodataStepLog]) -> pd.DataFrame:
+    """Tổng hợp lịch sử từng vòng lặp ISODATA thành bảng pandas DataFrame."""
+    rows = [
+        {
+            "Vòng": step.iteration,
+            "K": step.n_clusters,
+            "Số split": step.n_split,
+            "Số merge": step.n_merge,
+            "Số cụm bị loại": step.n_discarded,
+            "SSE": round(step.sse, 2),
+        }
+        for step in history
+    ]
+    return pd.DataFrame(
+        rows,
+        columns=["Vòng", "K", "Số split", "Số merge", "Số cụm bị loại", "SSE"],
     )
